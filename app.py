@@ -1491,7 +1491,7 @@ st.markdown(
 )
 
 dashboard_tab, log_tab, recommendation_tab, simulation_tab = st.tabs(
-    ["Dashboard", "Catat Makanan", "Rekomendasi", "What-if Simulation"]
+    ["Dashboard", "Catat Makanan", "Rekomendasi", "Simulasi"]
 )
 
 # =========================================================
@@ -2008,11 +2008,11 @@ with recommendation_tab:
                 st.dataframe(recommendations[cols], use_container_width=True, hide_index=True)
 
 # =========================================================
-# WHAT-IF SIMULATION
+# SIMULASI
 # =========================================================
 with simulation_tab:
     st.markdown("""<div class="page-hero"><span class="page-chip">Decision support</span><div class="page-title">Uji skenario sebelum mengubah kebiasaan</div><p class="page-desc">Bandingkan perubahan asupan harian dengan target energi dan protein secara sederhana.</p></div>""", unsafe_allow_html=True)
-    st.subheader("What-if Simulation: dampak perubahan asupan")
+    st.subheader("Simulasi: dampak perubahan asupan")
     st.write(f"**Tujuan profil:** {goal}")
     st.caption(
         "Simulasi menggunakan estimasi kebutuhan energi pemeliharaan (TDEE). "
