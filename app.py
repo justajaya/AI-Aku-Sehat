@@ -819,13 +819,11 @@ def _portion_limits(category, gym_focus):
 
 
 def build_recommendations(goal, gym_focus, remaining_calories, remaining_protein, query="", max_meal_kcal=None):
-    """Build a robust candidate pool from the existing Indonesian nutrition catalog.
+    """Build deterministic recommendation candidates from nutrition.csv.
 
-    The old workflow could return an empty DataFrame when a natural-language
-    preference contained several comma-separated foods. This version treats the
-    preference as a set of terms, ranks matching foods, and always falls back to
-    the full catalog when the preference is too restrictive. AI is used later to
-    interpret and compose a meal from this validated candidate pool.
+    A user preference is a HARD filter: when the user enters a food such as
+    "ayam", unrelated foods such as fish are removed before Gemini is called.
+    Multiple preferences separated by comma/semicolon/"dan" use OR semantics.
     """
     catalog = indonesia_catalog_only()
     if catalog.empty:
@@ -848,50 +846,64 @@ def build_recommendations(goal, gym_focus, remaining_calories, remaining_protein
         return pd.DataFrame()
 
     # ---------------------------------------------------------
-    # Preference matching: split comma/"dan" input into terms.
-    # Example: "ayam, nasi, telur" -> ayam | nasi | telur.
-    # A food only needs to match one term; matches are ranked higher.
+    # HARD PREFERENCE FILTER
     # ---------------------------------------------------------
     raw_query = str(query or "").strip()
-    terms = [t.strip() for t in re.split(r"[,;]|\bdan\b", raw_query, flags=re.IGNORECASE) if t.strip()]
+    terms = [
+        t.strip()
+        for t in re.split(r"[,;]|\bdan\b", raw_query, flags=re.IGNORECASE)
+        if t.strip()
+    ]
+
     if raw_query and terms:
-        match_score = pd.Series(0.0, index=candidates.index)
         names = candidates["food_name"].map(normalize_text)
+        match_mask = pd.Series(False, index=candidates.index)
+        preference_score = pd.Series(0.0, index=candidates.index)
+
         for term in terms:
-            variants = query_variants(term)
+            term_mask = pd.Series(False, index=candidates.index)
             term_score = pd.Series(0.0, index=candidates.index)
-            for variant in variants:
+
+            for variant in query_variants(term):
                 v = normalize_text(variant)
                 if not v:
                     continue
-                phrase = names.str.contains(re.escape(v), na=False)
-                term_score += phrase.astype(float) * 12
-                for word in v.split():
-                    if len(word) >= 3:
-                        term_score += names.str.contains(re.escape(word), na=False).astype(float) * 2
-            match_score += term_score.clip(upper=14)
-        # If the preference produces matches, use them first but keep the
-        # remainder available as alternatives. If it produces no matches,
-        # DO NOT show the old "no food found" dead-end.
-        matched = candidates.loc[match_score > 0].copy()
-        if not matched.empty:
-            matched["preference_score"] = match_score.loc[matched.index]
-            rest = candidates.loc[match_score <= 0].copy()
-            rest["preference_score"] = 0.0
-            candidates = pd.concat([matched, rest], ignore_index=True)
-        else:
-            candidates["preference_score"] = 0.0
-            st.info("Preferensi belum cocok dengan nama dataset secara langsung. Sistem tetap mencari pilihan yang paling sesuai dari katalog nutrisi.")
+
+                # Phrase match is intentionally strict. For example,
+                # "ayam" matches "ayam goreng" and "chicken breast",
+                # but cannot match "ikan".
+                phrase_mask = names.str.contains(
+                    rf"(?<!\w){re.escape(v)}(?!\w)", na=False, regex=True
+                )
+                term_mask |= phrase_mask
+                term_score += phrase_mask.astype(float) * 100
+
+            match_mask |= term_mask
+            preference_score += term_score
+
+        if not match_mask.any():
+            st.warning(
+                f"Tidak ditemukan makanan yang cocok dengan preferensi **{raw_query}** "
+                "di nutrition.csv. Silakan gunakan nama makanan yang tersedia di dataset."
+            )
+            return pd.DataFrame()
+
+        # Only matching foods survive. No unrelated fallback candidates.
+        candidates = candidates.loc[match_mask].copy()
+        candidates["preference_score"] = preference_score.loc[candidates.index]
     else:
         candidates["preference_score"] = 0.0
 
     candidates["is_indonesia"] = candidates["source"].eq("Nutrition Indonesia").astype(int)
-    candidates["protein_density"] = candidates["protein_g"] / candidates["calories"].clip(lower=1) * 100
-    candidates["fat_ratio"] = candidates["fat_g"] * 9 / candidates["calories"].clip(lower=1) * 100
+    candidates["protein_density"] = (
+        candidates["protein_g"] / candidates["calories"].clip(lower=1) * 100
+    )
+    candidates["fat_ratio"] = (
+        candidates["fat_g"] * 9 / candidates["calories"].clip(lower=1) * 100
+    )
 
-    # Base score combines user preference, protein density, fiber, goal and
-    # numerical fit. The numerical score remains deterministic and auditable.
-    candidates["score"] = candidates["preference_score"] * 3 + candidates["is_indonesia"] * 18
+    # Deterministic scoring: preference is dominant, then nutrition/goal fit.
+    candidates["score"] = candidates["preference_score"] * 8 + candidates["is_indonesia"] * 18
     candidates["score"] += np.where(
         candidates["category"].eq("Protein utama"),
         candidates["protein_g"] * 1.8 + candidates["protein_density"] * 1.2,
@@ -912,7 +924,11 @@ def build_recommendations(goal, gym_focus, remaining_calories, remaining_protein
 
     def choose_portion(row):
         low, high = _portion_limits(row["category"], gym_focus)
-        target_kcal = min(max(float(remaining_calories or 0), 150), float(max_meal_kcal or 450), 450)
+        target_kcal = min(
+            max(float(remaining_calories or 0), 150),
+            float(max_meal_kcal or 450),
+            450,
+        )
         estimated = target_kcal / max(float(row["calories"]), 1) * 100
         return float(np.clip(estimated, low, high))
 
@@ -920,22 +936,29 @@ def build_recommendations(goal, gym_focus, remaining_calories, remaining_protein
     candidates["portion_calories"] = candidates["calories"] * candidates["reference_grams"] / 100
     candidates["portion_protein"] = candidates["protein_g"] * candidates["reference_grams"] / 100
     candidates["portion_carbs"] = candidates["carbs_g"] * candidates["reference_grams"] / 100
+    candidates["portion_fat"] = candidates["fat_g"] * candidates["reference_grams"] / 100
 
     if remaining_calories > 0:
-        target = min(float(remaining_calories), 450)
-        candidates["score"] -= abs(candidates["portion_calories"] - target) / max(target, 1) * 1.5
+        target = min(float(remaining_calories), float(max_meal_kcal or 450), 450)
+        candidates["score"] -= (
+            abs(candidates["portion_calories"] - target) / max(target, 1) * 1.5
+        )
     if remaining_protein > 0:
-        candidates["score"] += candidates["portion_protein"].clip(upper=remaining_protein) / max(remaining_protein, 1) * 5
+        candidates["score"] += (
+            candidates["portion_protein"].clip(upper=remaining_protein)
+            / max(remaining_protein, 1) * 5
+        )
 
     candidates = candidates.sort_values(
-        ["score", "preference_score", "protein_density"], ascending=[False, False, False]
+        ["score", "preference_score", "protein_density"],
+        ascending=[False, False, False],
     )
 
     selected = []
     category_counts = {}
     for _, row in candidates.iterrows():
         cat = row["category"]
-        if category_counts.get(cat, 0) >= 3:
+        if category_counts.get(cat, 0) >= 4:
             continue
         selected.append(row)
         category_counts[cat] = category_counts.get(cat, 0) + 1
@@ -947,11 +970,12 @@ def build_recommendations(goal, gym_focus, remaining_calories, remaining_protein
 
     result = pd.DataFrame(selected).copy().reset_index(drop=True)
     result["reason"] = result.apply(
-        lambda row: recommendation_reason(goal, gym_focus, row, remaining_calories, remaining_protein),
+        lambda row: recommendation_reason(
+            goal, gym_focus, row, remaining_calories, remaining_protein
+        ),
         axis=1,
     )
     return result
-
 
 def generate_ai_meal_recommendation(goal, gym_focus, remaining_calories, remaining_protein, preference, candidates, max_meal_kcal=None):
     """Use Gemini to turn validated dataset candidates into a personalized meal.
@@ -1921,8 +1945,23 @@ with recommendation_tab:
         recommendation_query = st.text_input(
             "Preferensi makanan (opsional)",
             placeholder="Contoh: ayam, nasi, telur, makanan murah...",
-            help="Boleh memasukkan beberapa preferensi sekaligus. Sistem akan memecahnya menjadi beberapa kata kunci."
+            help="Boleh memasukkan beberapa preferensi sekaligus. Jika diisi, sistem hanya menampilkan makanan yang cocok dengan preferensi tersebut."
         )
+
+    # Clear stale recommendation results whenever the preference changes.
+    # This prevents an older result (for example, fish) from remaining visible
+    # after the user types a new preference such as "ayam".
+    _current_preference_key = normalize_text(recommendation_query)
+    _previous_preference_key = st.session_state.get("_recommendation_preference_key")
+    if _previous_preference_key is not None and _current_preference_key != _previous_preference_key:
+        for _key in [
+            "recommendation_result",
+            "ai_recommendation_text",
+            "ai_recommendation_model",
+            "ai_recommendation_error",
+        ]:
+            st.session_state.pop(_key, None)
+    st.session_state["_recommendation_preference_key"] = _current_preference_key
     with q2:
         max_meal_kcal = st.number_input(
             "Batas kalori rekomendasi", min_value=100.0, max_value=1500.0,
@@ -1942,6 +1981,7 @@ with recommendation_tab:
     )
 
     if st.button("✨ Buat rekomendasi dengan AI", type="primary", use_container_width=True):
+        st.session_state["_recommendation_preference_key"] = normalize_text(recommendation_query)
         with st.spinner("Menyiapkan kandidat nutrisi dan meminta AI memilih kombinasi yang sesuai..."):
             recommendations = build_recommendations(
                 goal, gym_focus, remaining_calories, remaining_protein, recommendation_query, max_meal_kcal
@@ -1956,6 +1996,26 @@ with recommendation_tab:
             st.session_state["ai_recommendation_error"] = ai_error
 
     recommendations = st.session_state.get("recommendation_result")
+
+    # Final safety check for the UI: if a preference is active, never display
+    # a candidate that does not match it. This is independent of Gemini.
+    if isinstance(recommendations, pd.DataFrame) and not recommendations.empty and recommendation_query.strip():
+        _display_terms = [
+            t.strip()
+            for t in re.split(r"[,;]|\bdan\b", recommendation_query, flags=re.IGNORECASE)
+            if t.strip()
+        ]
+        _display_names = recommendations["food_name"].fillna("").astype(str).map(normalize_text)
+        _display_mask = pd.Series(False, index=recommendations.index)
+        for _term in _display_terms:
+            for _variant in query_variants(_term):
+                _v = normalize_text(_variant)
+                if _v:
+                    _display_mask |= _display_names.str.contains(
+                        rf"(?<!\w){re.escape(_v)}(?!\w)", na=False, regex=True
+                    )
+        recommendations = recommendations.loc[_display_mask].copy().reset_index(drop=True)
+
     ai_text = st.session_state.get("ai_recommendation_text")
     ai_error = st.session_state.get("ai_recommendation_error")
 
